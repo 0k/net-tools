@@ -78,10 +78,22 @@ impl UdpSocket {
     }
 
     /// Rebind the underlying socket.
+    ///
+    /// On failure the old socket is already closed, so the socket is marked
+    /// broken: the next send or receive retries the bind (see
+    /// `maybe_rebind`) instead of the socket staying closed until someone
+    /// calls `rebind` again.  A pinned port can be briefly unavailable, e.g.
+    /// while a process forked from this one still holds a copy of the old
+    /// socket between `fork` and `exec`.
     pub fn rebind(&self) -> io::Result<()> {
         {
             let mut guard = self.socket.write().unwrap();
-            guard.rebind()?;
+            if let Err(err) = guard.rebind() {
+                self.mark_broken();
+                drop(guard);
+                self.wake_all();
+                return Err(err);
+            }
 
             // Clear errors
             self.is_broken
@@ -1159,6 +1171,44 @@ mod tests {
         assert!(!socket_a.is_broken());
 
         handle.await?;
+        Ok(())
+    }
+
+    /// A rebind that fails because the port is still held must not leave the
+    /// socket closed: once the port is free, the next send rebinds it.
+    ///
+    /// The port is held by a duplicate of the socket's own descriptor, which
+    /// is exactly what a child process holds between `fork` and `exec`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_failed_rebind_is_retried_on_next_send() -> TestResult {
+        use std::os::fd::AsFd;
+
+        let socket = UdpSocket::bind_local(IpFamily::V4, 0)?;
+        let addr = socket.local_addr()?;
+        let peer = UdpSocket::bind_local(IpFamily::V4, 0)?;
+        let peer_addr = peer.local_addr()?;
+
+        let forked_copy = {
+            let guard = socket.socket.read().unwrap();
+            let (inner, _state) = guard.try_get_connected()?;
+            inner.as_fd().try_clone_to_owned()?
+        };
+
+        let err = socket.rebind().expect_err("port is still held by the copy");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert!(socket.is_broken());
+
+        drop(forked_copy);
+
+        socket.send_to(b"back", peer_addr).await?;
+        assert!(!socket.is_broken());
+        assert_eq!(socket.local_addr()?, addr);
+
+        let mut buf = [0u8; 16];
+        let (n, from) = peer.recv_from(&mut buf).await?;
+        assert_eq!(&buf[..n], b"back");
+        assert_eq!(from, addr);
         Ok(())
     }
 
