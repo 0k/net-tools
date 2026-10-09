@@ -207,6 +207,52 @@ impl RouteMonitor {
     }
 }
 
-pub(crate) fn is_interesting_interface(_name: &str) -> bool {
-    true
+/// Name prefixes of host-local virtual interfaces created by container and
+/// VM managers (docker, libvirt, podman): bridges and their `veth` pairs.
+///
+/// They never carry a path to another host, yet a container that restarts
+/// in a loop creates and deletes a `veth` (and toggles its bridge) every few
+/// seconds.  Treating that churn as a network change makes every socket
+/// rebind constantly, and advertising the bridge addresses hands remote
+/// peers candidates they can never reach.
+const VIRTUAL_BRIDGE_PREFIXES: &[&str] = &["br-", "docker", "veth", "virbr"];
+
+/// Whether `name` is a container/VM virtual bridge or `veth` interface.
+pub(crate) fn is_virtual_bridge_interface(name: &str) -> bool {
+    VIRTUAL_BRIDGE_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+pub(crate) fn is_interesting_interface(name: &str) -> bool {
+    !is_virtual_bridge_interface(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_and_vm_bridges_are_not_interesting() {
+        for name in ["docker0", "br-a8b37eb8b48f", "veth8c0b68e", "virbr0"] {
+            assert!(!is_interesting_interface(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn physical_and_tunnel_interfaces_stay_interesting() {
+        for name in [
+            "eth0",
+            "enp3s0",
+            "enx00e04c6810f4",
+            "wlp192s0",
+            "wlan0",
+            "wg0",
+            "tailscale0",
+            "lo",
+            "bridge0",
+        ] {
+            assert!(is_interesting_interface(name), "{name}");
+        }
+    }
 }

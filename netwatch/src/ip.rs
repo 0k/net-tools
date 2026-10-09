@@ -48,6 +48,10 @@ impl LocalAddresses {
                 // Skip down interfaces
                 continue;
             }
+            if is_virtual_bridge(&iface.name) {
+                // Host-local container/VM bridge: unreachable from peers.
+                continue;
+            }
             let ifc_is_loopback = is_loopback(iface);
             let addrs = iface
                 .ipv4
@@ -98,6 +102,24 @@ impl LocalAddresses {
         loopback.sort();
 
         LocalAddresses { loopback, regular }
+    }
+}
+
+/// Whether `name` is a host-local container/VM bridge or `veth` interface.
+///
+/// Its addresses neither give the host connectivity nor reach any peer, so
+/// they are left out of [`LocalAddresses`] and of the v4/v6 availability
+/// flags.  Only recognised on Linux.
+#[cfg(not(wasm_browser))]
+pub(crate) fn is_virtual_bridge(name: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::netmon::is_virtual_bridge_interface(name)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = name;
+        false
     }
 }
 

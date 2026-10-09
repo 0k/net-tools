@@ -34,7 +34,7 @@ use self::linux::default_route;
 use self::windows::default_route;
 #[cfg(not(wasm_browser))]
 use crate::ip::is_link_local;
-use crate::ip::{LocalAddresses, is_private_v6, is_up};
+use crate::ip::{LocalAddresses, is_private_v6, is_up, is_virtual_bridge};
 #[cfg(not(wasm_browser))]
 use crate::netmon::is_interesting_interface;
 
@@ -272,7 +272,7 @@ impl State {
             let name = ni.iface.name.clone();
             let pfxs: Vec<_> = ni.addrs().collect();
 
-            if if_up {
+            if if_up && !is_virtual_bridge(&name) {
                 for pfx in &pfxs {
                     if pfx.addr().is_loopback() {
                         continue;
@@ -512,6 +512,60 @@ mod tests {
         let a = State::fake();
         let b = State::fake();
         assert!(!a.is_major_change(&b));
+    }
+
+    /// A copy of the fake interface renamed and re-addressed.
+    #[cfg(target_os = "linux")]
+    fn fake_iface(name: &str, ip: std::net::Ipv4Addr, index: u32) -> netdev::Interface {
+        let mut iface = Interface::fake().iface;
+        iface.name = name.to_string();
+        iface.index = index;
+        iface.ipv4 = vec![Ipv4Net::new(ip, 16).unwrap()];
+        iface
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_iface(state: &State, iface: netdev::Interface) -> State {
+        let mut state = state.clone();
+        state
+            .interfaces
+            .insert(iface.name.clone(), Interface { iface });
+        state
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn container_bridge_churn_is_not_a_major_change() {
+        use std::net::Ipv4Addr;
+        let base = State::fake();
+        for name in ["veth8c0b68e", "br-a8b37eb8b48f", "docker0", "virbr0"] {
+            let churned = with_iface(&base, fake_iface(name, Ipv4Addr::new(172, 30, 0, 1), 9));
+            assert!(!churned.is_major_change(&base), "{name} appeared");
+            assert!(!base.is_major_change(&churned), "{name} disappeared");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_new_physical_interface_is_still_a_major_change() {
+        use std::net::Ipv4Addr;
+        let base = State::fake();
+        let plugged = with_iface(&base, fake_iface("eth1", Ipv4Addr::new(10, 0, 0, 2), 9));
+        assert!(plugged.is_major_change(&base));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn container_bridge_addresses_are_not_local_addresses() {
+        use std::net::Ipv4Addr;
+        let lan = Interface::fake().iface;
+        let ifaces = [
+            lan,
+            fake_iface("docker0", Ipv4Addr::new(172, 17, 0, 1), 3),
+            fake_iface("br-a8b37eb8b48f", Ipv4Addr::new(172, 30, 0, 1), 4),
+        ];
+        let addrs = LocalAddresses::from_raw_interfaces(&ifaces);
+        assert_eq!(addrs.regular, vec![IpAddr::from([192, 168, 0, 189])]);
     }
 
     #[test]

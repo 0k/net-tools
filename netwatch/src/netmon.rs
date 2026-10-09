@@ -28,6 +28,8 @@ mod windows;
 #[cfg(not(any(posix_minimal, wasm_browser)))]
 pub(crate) use self::actor::is_interesting_interface;
 use self::actor::{Actor, ActorMessage};
+#[cfg(target_os = "linux")]
+pub(crate) use self::linux::is_virtual_bridge_interface;
 pub use crate::interfaces::State;
 
 /// Monitors networking interface and route changes.
