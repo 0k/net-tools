@@ -34,7 +34,7 @@ fn to_ipv6_addr_flags(flags: netdev::interface::ipv6_addr_flags::Ipv6AddrFlags) 
 ///
 /// Addresses are sorted (IPv4 first, then IPv6, each by address) so that
 /// comparisons between successive snapshots are stable.
-fn to_interface(iface: netdev::Interface) -> Interface {
+fn to_interface(iface: netdev::Interface, host_local: bool) -> Interface {
     // netdev keeps these three IPv6 arrays parallel, one entry per address.
     // The zip below relies on that; assert it so a netdev change that breaks
     // the invariant surfaces in tests rather than silently dropping addresses.
@@ -68,21 +68,25 @@ fn to_interface(iface: netdev::Interface) -> Interface {
         flags: iface.flags,
         mac_addr: iface.mac_addr.as_ref().map(|a| a.octets()),
         addrs,
+        host_local,
     }
 }
 
 /// Enumerates the machine's network interfaces and assembles the [`State`].
 pub(super) async fn get_state() -> State {
     let raw = netdev::interface::get_interfaces();
-    let local_addresses = local_addresses(&raw);
+    let default_route_interface = super::default_route_interface().await;
+    let is_host_local = host_local_classifier(default_route_interface.as_deref());
+    let local_addresses = local_addresses(&raw, &is_host_local);
 
     let mut interfaces = std::collections::HashMap::new();
     let mut have_v6 = false;
     let mut have_v4 = false;
 
     for raw in raw {
-        let iface = to_interface(raw);
-        if iface.is_up() && !super::is_virtual_bridge(iface.name()) {
+        let host_local = is_host_local(&raw.name);
+        let iface = to_interface(raw, host_local);
+        if iface.is_up() && !iface.is_host_local() {
             for pfx in iface.addrs() {
                 let addr = pfx.addr();
                 if addr.is_loopback() {
@@ -95,8 +99,7 @@ pub(super) async fn get_state() -> State {
         interfaces.insert(iface.name().to_string(), iface);
     }
 
-    let default_route_interface = super::default_route_interface().await;
-
+    drop(is_host_local);
     State {
         interfaces,
         local_addresses,
@@ -182,12 +185,27 @@ const fn is_loopback(interface: &netdev::Interface) -> bool {
     interface.flags & IFF_LOOPBACK != 0
 }
 
+/// Classifies interface names with [`super::is_host_local_virtual`] against
+/// the live `sysfs`, given the interface holding the default route.
+fn host_local_classifier(default_route: Option<&str>) -> impl Fn(&str) -> bool + '_ {
+    move |name| {
+        #[cfg(target_os = "linux")]
+        let sysfs = std::path::Path::new(super::SYSFS_NET);
+        #[cfg(not(target_os = "linux"))]
+        let sysfs = std::path::Path::new("");
+        super::is_host_local_virtual(sysfs, name, default_route)
+    }
+}
+
 /// Builds the machine's [`LocalAddresses`] from a raw `netdev` interface list.
 ///
 /// If there are no regular addresses it falls back to IPv4 link-local or IPv6
 /// unique-local addresses, because we know of environments where these are used
 /// with NAT to provide connectivity.
-fn local_addresses(ifaces: &[netdev::Interface]) -> LocalAddresses {
+fn local_addresses(
+    ifaces: &[netdev::Interface],
+    is_host_local: &dyn Fn(&str) -> bool,
+) -> LocalAddresses {
     let mut loopback = Vec::new();
     let mut regular4 = Vec::new();
     let mut regular6 = Vec::new();
@@ -199,7 +217,7 @@ fn local_addresses(ifaces: &[netdev::Interface]) -> LocalAddresses {
             // Skip down interfaces
             continue;
         }
-        if super::is_virtual_bridge(&iface.name) {
+        if is_host_local(&iface.name) {
             // Host-local container/VM bridge: unreachable from peers.
             continue;
         }
@@ -262,7 +280,11 @@ impl LocalAddresses {
     /// IPv6 unique-local addresses, because we know of environments where these
     /// are used with NAT to provide connectivity.
     pub fn new() -> Self {
-        local_addresses(&netdev::interface::get_interfaces())
+        let default_route = netdev::get_default_interface().ok().map(|i| i.name);
+        local_addresses(
+            &netdev::interface::get_interfaces(),
+            &host_local_classifier(default_route.as_deref()),
+        )
     }
 }
 
@@ -292,7 +314,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn container_bridge_addresses_are_not_local_addresses() {
+    fn host_local_addresses_are_not_local_addresses() {
         use std::net::Ipv4Addr;
         let ifaces = [
             raw_iface("wifi0", Ipv4Addr::new(192, 168, 0, 189), 2),
@@ -300,7 +322,7 @@ mod tests {
             raw_iface("br-a8b37eb8b48f", Ipv4Addr::new(172, 30, 0, 1), 4),
             raw_iface("veth8c0b68e", Ipv4Addr::new(172, 30, 0, 2), 5),
         ];
-        let addrs = local_addresses(&ifaces);
+        let addrs = local_addresses(&ifaces, &|name| name != "wifi0");
         assert_eq!(addrs.regular, vec![IpAddr::from([192, 168, 0, 189])]);
     }
 

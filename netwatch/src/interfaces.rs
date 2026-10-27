@@ -194,6 +194,10 @@ pub struct Interface {
     mac_addr: Option<[u8; 6]>,
     /// The IP networks assigned to the interface.
     addrs: Vec<IpNet>,
+    /// Host-local container/VM plumbing (a bridge or a `veth`), see
+    /// [`is_host_local_virtual`].  Decided once, when the interface is
+    /// enumerated.
+    host_local: bool,
 }
 
 impl PartialEq for Interface {
@@ -223,6 +227,15 @@ impl Interface {
         self.addrs.iter().cloned()
     }
 
+    /// Is this a host-local container/VM bridge or `veth`?
+    ///
+    /// Such an interface never carries a path to another host: its churn is
+    /// not a major change, and its addresses are neither local addresses nor
+    /// evidence of IPv4/IPv6 connectivity.
+    pub fn is_host_local(&self) -> bool {
+        self.host_local
+    }
+
     /// Creates a fake interface for usage in tests.
     ///
     /// This allows tests to be independent of the host interfaces.
@@ -235,6 +248,7 @@ impl Interface {
             addrs: vec![IpNet::V4(
                 Ipv4Net::new(Ipv4Addr::new(192, 168, 0, 189), 24).unwrap(),
             )],
+            host_local: false,
         }
     }
 }
@@ -327,7 +341,7 @@ impl State {
         }
 
         for (iname, i) in &old.interfaces {
-            if !is_interesting_interface(i.name()) {
+            if !is_interesting_interface(i.name()) || i.is_host_local() {
                 continue;
             }
             let Some(i2) = self.interfaces.get(iname) else {
@@ -340,7 +354,7 @@ impl State {
 
         // Check for new interesting interfaces not present in old state
         for (iname, i) in &self.interfaces {
-            if !is_interesting_interface(i.name()) {
+            if !is_interesting_interface(i.name()) || i.is_host_local() {
                 continue;
             }
             if !old.interfaces.contains_key(iname) {
@@ -365,35 +379,46 @@ pub(crate) fn is_interesting_interface(name: &str) -> bool {
             return false;
         }
     }
-    !is_virtual_bridge(name)
+    let _ = name;
+    true
 }
 
-/// Name prefixes of host-local virtual interfaces created by container and
-/// VM managers (docker, libvirt, podman): bridges and their `veth` pairs.
+/// Where Linux exposes one directory per network interface.
+#[cfg(target_os = "linux")]
+pub(crate) const SYSFS_NET: &str = "/sys/class/net";
+
+/// Whether the interface `name` is host-local container/VM plumbing.
 ///
-/// They never carry a path to another host, yet a container that restarts
-/// in a loop creates and deletes a `veth` (and toggles its bridge) every few
-/// seconds.  Treating that churn as a network change makes every socket
+/// Docker, podman, LXC and libvirt connect containers and VMs through
+/// bridges (`docker0`, `br-*`, `lxcbr0`, `virbr0`, ...) and `veth` pairs.
+/// These never carry a path to another host, yet a container restarting in
+/// a loop creates and deletes a `veth` (and toggles its bridge) every few
+/// seconds: treating that churn as a network change makes every socket
 /// rebind constantly, and advertising the bridge addresses hands remote
 /// peers candidates they can never reach.
-#[cfg(target_os = "linux")]
-const VIRTUAL_BRIDGE_PREFIXES: &[&str] = &["br-", "docker", "veth", "virbr"];
-
-/// Whether `name` is a host-local container/VM bridge or `veth` interface.
 ///
-/// Such interfaces are not interesting (their churn is not a major change),
-/// and their addresses are left out of [`LocalAddresses`] and of the v4/v6
-/// availability flags.  Only recognised on Linux.
-pub(crate) fn is_virtual_bridge(name: &str) -> bool {
+/// A bridge is recognised by the kernel, not by its name: it has a
+/// `bridge` directory under `sysfs_net`.  A `veth` is recognised by its
+/// name, which every container runtime gives it.  The interface holding the
+/// default route is never host-local, so a host whose uplink is itself a
+/// bridge (`br0` enslaving the NIC, common on VM hosts) keeps it.
+///
+/// Only recognised on Linux.
+pub(crate) fn is_host_local_virtual(
+    sysfs_net: &std::path::Path,
+    name: &str,
+    default_route: Option<&str>,
+) -> bool {
     #[cfg(target_os = "linux")]
     {
-        VIRTUAL_BRIDGE_PREFIXES
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
+        if default_route == Some(name) {
+            return false;
+        }
+        name.starts_with("veth") || sysfs_net.join(name).join("bridge").is_dir()
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = name;
+        let _ = (sysfs_net, name, default_route);
         false
     }
 }
@@ -487,66 +512,107 @@ mod tests {
     }
 
     /// A copy of the fake interface renamed and re-addressed.
-    #[cfg(target_os = "linux")]
-    fn fake_iface(name: &str, ip: Ipv4Addr, index: u32) -> Interface {
+    fn fake_iface(name: &str, ip: Ipv4Addr, index: u32, host_local: bool) -> Interface {
         let mut iface = Interface::fake();
         iface.name = name.to_string();
         iface.index = index;
         iface.addrs = vec![IpNet::V4(Ipv4Net::new(ip, 16).unwrap())];
+        iface.host_local = host_local;
         iface
     }
 
-    #[cfg(target_os = "linux")]
     fn with_iface(state: &State, iface: Interface) -> State {
         let mut state = state.clone();
         state.interfaces.insert(iface.name.clone(), iface);
         state
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn container_bridge_churn_is_not_a_major_change() {
+    fn host_local_interface_churn_is_not_a_major_change() {
         let base = State::fake();
-        for name in ["veth8c0b68e", "br-a8b37eb8b48f", "docker0", "virbr0"] {
-            let churned = with_iface(&base, fake_iface(name, Ipv4Addr::new(172, 30, 0, 1), 9));
-            assert!(!churned.is_major_change(&base), "{name} appeared");
-            assert!(!base.is_major_change(&churned), "{name} disappeared");
-        }
+        let churned = with_iface(
+            &base,
+            fake_iface("lxcbr0", Ipv4Addr::new(10, 0, 3, 1), 9, true),
+        );
+        assert!(!churned.is_major_change(&base), "appeared");
+        assert!(!base.is_major_change(&churned), "disappeared");
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_new_physical_interface_is_still_a_major_change() {
         let base = State::fake();
-        let plugged = with_iface(&base, fake_iface("eth1", Ipv4Addr::new(10, 0, 0, 2), 9));
+        let plugged = with_iface(
+            &base,
+            fake_iface("eth1", Ipv4Addr::new(10, 0, 0, 2), 9, false),
+        );
         assert!(plugged.is_major_change(&base));
+    }
+
+    /// A throwaway `sysfs`-like tree: one directory per interface, with a
+    /// `bridge` subdirectory for bridges.
+    #[cfg(target_os = "linux")]
+    struct FakeSysfs(std::path::PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl FakeSysfs {
+        fn new(bridges: &[&str], others: &[&str]) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "netwatch-sysfs-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            for name in bridges {
+                std::fs::create_dir_all(root.join(name).join("bridge")).unwrap();
+            }
+            for name in others {
+                std::fs::create_dir_all(root.join(name)).unwrap();
+            }
+            Self(root)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for FakeSysfs {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn container_and_vm_bridges_are_not_interesting() {
-        for name in ["docker0", "br-a8b37eb8b48f", "veth8c0b68e", "virbr0"] {
-            assert!(is_virtual_bridge(name), "{name}");
-            assert!(!is_interesting_interface(name), "{name}");
+    fn bridges_are_recognised_by_the_kernel_not_by_their_name() {
+        let sysfs = FakeSysfs::new(
+            &["docker0", "br-a8b37eb8b48f", "lxcbr0", "virbr0", "podman0"],
+            &["eth0", "wlp192s0", "wg0", "br-lan-not-a-bridge"],
+        );
+        for name in ["docker0", "br-a8b37eb8b48f", "lxcbr0", "virbr0", "podman0"] {
+            assert!(
+                is_host_local_virtual(&sysfs.0, name, Some("eth0")),
+                "{name}"
+            );
+        }
+        for name in ["eth0", "wlp192s0", "wg0", "br-lan-not-a-bridge", "missing0"] {
+            assert!(
+                !is_host_local_virtual(&sysfs.0, name, Some("eth0")),
+                "{name}"
+            );
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn physical_and_tunnel_interfaces_stay_interesting() {
-        for name in [
-            "eth0",
-            "enp3s0",
-            "enx00e04c6810f4",
-            "wlp192s0",
-            "wlan0",
-            "wg0",
-            "tailscale0",
-            "lo",
-            "bridge0",
-        ] {
-            assert!(!is_virtual_bridge(name), "{name}");
-            assert!(is_interesting_interface(name), "{name}");
-        }
+    fn veth_pairs_are_host_local() {
+        let sysfs = FakeSysfs::new(&[], &[]);
+        assert!(is_host_local_virtual(&sysfs.0, "veth8c0b68e", Some("eth0")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bridge_holding_the_default_route_is_kept() {
+        let sysfs = FakeSysfs::new(&["br0"], &[]);
+        assert!(!is_host_local_virtual(&sysfs.0, "br0", Some("br0")));
+        assert!(is_host_local_virtual(&sysfs.0, "br0", Some("eth0")));
+        assert!(is_host_local_virtual(&sysfs.0, "br0", None));
     }
 
     #[test]
