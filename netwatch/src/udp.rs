@@ -4,11 +4,13 @@ use std::{
     net::SocketAddr,
     num::NonZeroUsize,
     pin::Pin,
-    sync::{Arc, RwLock, RwLockReadGuard, TryLockError, atomic::AtomicBool},
+    sync::{Arc, Mutex, RwLock, RwLockReadGuard, TryLockError, atomic::AtomicBool},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use atomic_waker::AtomicWaker;
+use n0_future::time::Instant;
 use noq_udp::Transmit;
 use tokio::io::Interest;
 use tracing::{debug, trace, warn};
@@ -23,6 +25,67 @@ pub struct UdpSocket {
     send_waker: AtomicWaker,
     /// Set to true, when an error occurred, that means we need to rebind the socket.
     is_broken: AtomicBool,
+    /// Pacing of the retries after a failed rebind.
+    retry: Mutex<RebindRetry>,
+}
+
+/// Delay before the first retry of a failed rebind.
+const REBIND_RETRY_MIN: Duration = Duration::from_millis(100);
+/// Longest delay between two retries of a failed rebind.
+const REBIND_RETRY_MAX: Duration = Duration::from_secs(5);
+
+/// When a broken socket may next try to bind again.
+///
+/// A failed rebind leaves the socket closed and broken; sends and receives
+/// retry the bind, but at most once per `delay`, which doubles after each
+/// failure up to [`REBIND_RETRY_MAX`] and resets on success.  Retries never
+/// stop: giving up would leave the socket closed until the next network
+/// change, while the endpoint carries on over its other transports.
+#[derive(Debug)]
+struct RebindRetry {
+    /// No retry before this instant; `None` once the socket is bound.
+    not_before: Option<Instant>,
+    /// Delay applied after the next failure.
+    delay: Duration,
+    /// Kind of the last bind failure, reported while a retry is not due.
+    last_error: io::ErrorKind,
+}
+
+impl Default for RebindRetry {
+    fn default() -> Self {
+        Self {
+            not_before: None,
+            delay: REBIND_RETRY_MIN,
+            last_error: io::ErrorKind::Other,
+        }
+    }
+}
+
+impl RebindRetry {
+    fn failed(&mut self, err: &io::Error) {
+        self.not_before = Some(Instant::now() + self.delay);
+        self.delay = (self.delay * 2).min(REBIND_RETRY_MAX);
+        self.last_error = err.kind();
+    }
+
+    fn succeeded(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The error to report instead of binding, while a retry is not due.
+    fn deferred(&self) -> Option<io::Error> {
+        let not_before = self.not_before?;
+        let now = Instant::now();
+        (now < not_before).then(|| {
+            io::Error::new(
+                self.last_error,
+                format!(
+                    "socket rebind failed, next attempt in {:?}",
+                    not_before - now
+                ),
+            )
+        })
+    }
 }
 
 /// UDP socket read/write buffer size (7MB). The value of 7MB is chosen as it
@@ -80,20 +143,24 @@ impl UdpSocket {
     /// Rebind the underlying socket.
     ///
     /// On failure the old socket is already closed, so the socket is marked
-    /// broken: the next send or receive retries the bind (see
-    /// `maybe_rebind`) instead of the socket staying closed until someone
+    /// broken: later sends and receives retry the bind, paced by
+    /// [`RebindRetry`], instead of the socket staying closed until someone
     /// calls `rebind` again.  A pinned port can be briefly unavailable, e.g.
     /// while a process forked from this one still holds a copy of the old
     /// socket between `fork` and `exec`.
+    ///
+    /// An explicit call always attempts the bind at once.
     pub fn rebind(&self) -> io::Result<()> {
         {
             let mut guard = self.socket.write().unwrap();
             if let Err(err) = guard.rebind() {
+                self.retry.lock().unwrap().failed(&err);
                 self.mark_broken();
                 drop(guard);
                 self.wake_all();
                 return Err(err);
             }
+            self.retry.lock().unwrap().succeeded();
 
             // Clear errors
             self.is_broken
@@ -116,6 +183,7 @@ impl UdpSocket {
             recv_waker: AtomicWaker::default(),
             send_waker: AtomicWaker::default(),
             is_broken: AtomicBool::new(false),
+            retry: Mutex::default(),
         })
     }
 
@@ -292,10 +360,13 @@ impl UdpSocket {
 
     /// Checks if the socket needs a rebind, and if so does it.
     ///
-    /// Returns an error if the rebind is needed, but failed.
+    /// Returns an error if the rebind is needed, but failed or is not due yet.
     fn maybe_rebind(&self) -> io::Result<()> {
         if !self.is_broken() {
             return Ok(());
+        }
+        if let Some(err) = self.retry.lock().unwrap().deferred() {
+            return Err(err);
         }
 
         let mut guard = self.socket.write().unwrap_or_else(|e| e.into_inner());
@@ -306,7 +377,11 @@ impl UdpSocket {
             return Ok(());
         }
 
-        guard.rebind()?;
+        if let Err(err) = guard.rebind() {
+            self.retry.lock().unwrap().failed(&err);
+            return Err(err);
+        }
+        self.retry.lock().unwrap().succeeded();
         self.is_broken
             .store(false, std::sync::atomic::Ordering::Release);
         drop(guard);
@@ -1174,33 +1249,33 @@ mod tests {
         Ok(())
     }
 
+    /// A duplicate of the socket's own descriptor: exactly what a child
+    /// process holds between `fork` and `exec`, keeping the port in use.
+    #[cfg(unix)]
+    fn hold_port(socket: &UdpSocket) -> std::os::fd::OwnedFd {
+        use std::os::fd::AsFd;
+        let guard = socket.socket.read().unwrap();
+        let (inner, _state) = guard.try_get_connected().unwrap();
+        inner.as_fd().try_clone_to_owned().unwrap()
+    }
+
     /// A rebind that fails because the port is still held must not leave the
-    /// socket closed: once the port is free, the next send rebinds it.
-    ///
-    /// The port is held by a duplicate of the socket's own descriptor, which
-    /// is exactly what a child process holds between `fork` and `exec`.
+    /// socket closed: once the port is free, a later send rebinds it.
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_failed_rebind_is_retried_on_next_send() -> TestResult {
-        use std::os::fd::AsFd;
-
+    async fn test_failed_rebind_is_retried_on_a_later_send() -> TestResult {
         let socket = UdpSocket::bind_local(IpFamily::V4, 0)?;
         let addr = socket.local_addr()?;
         let peer = UdpSocket::bind_local(IpFamily::V4, 0)?;
         let peer_addr = peer.local_addr()?;
 
-        let forked_copy = {
-            let guard = socket.socket.read().unwrap();
-            let (inner, _state) = guard.try_get_connected()?;
-            inner.as_fd().try_clone_to_owned()?
-        };
-
+        let held = hold_port(&socket);
         let err = socket.rebind().expect_err("port is still held by the copy");
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
         assert!(socket.is_broken());
+        drop(held);
 
-        drop(forked_copy);
-
+        tokio::time::sleep(REBIND_RETRY_MIN * 2).await;
         socket.send_to(b"back", peer_addr).await?;
         assert!(!socket.is_broken());
         assert_eq!(socket.local_addr()?, addr);
@@ -1210,6 +1285,53 @@ mod tests {
         assert_eq!(&buf[..n], b"back");
         assert_eq!(from, addr);
         Ok(())
+    }
+
+    /// While the port stays held, traffic does not turn into one bind attempt
+    /// per packet: attempts are spaced by a doubling delay, reset on success.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_failed_rebind_retries_are_paced() -> TestResult {
+        let socket = UdpSocket::bind_local(IpFamily::V4, 0)?;
+        let peer_addr = UdpSocket::bind_local(IpFamily::V4, 0)?.local_addr()?;
+        let delay = || socket.retry.lock().unwrap().delay;
+
+        let held = hold_port(&socket);
+        socket.rebind().expect_err("port is held");
+        assert_eq!(delay(), REBIND_RETRY_MIN * 2);
+
+        // Within the delay: no attempt, whatever the traffic.
+        for _ in 0..50 {
+            let err = socket.send_to(b"x", peer_addr).await.expect_err("not due");
+            assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        }
+        assert_eq!(delay(), REBIND_RETRY_MIN * 2, "no attempt was made");
+
+        // Once due, one attempt, which fails again and doubles the delay.
+        tokio::time::sleep(REBIND_RETRY_MIN * 2).await;
+        socket
+            .send_to(b"x", peer_addr)
+            .await
+            .expect_err("still held");
+        assert_eq!(delay(), REBIND_RETRY_MIN * 4);
+
+        drop(held);
+        // An explicit rebind does not wait for the delay, and resets it.
+        socket.rebind()?;
+        assert!(!socket.is_broken());
+        assert_eq!(delay(), REBIND_RETRY_MIN);
+        socket.send_to(b"x", peer_addr).await?;
+        Ok(())
+    }
+
+    #[test]
+    fn rebind_retry_delay_is_capped() {
+        let mut retry = RebindRetry::default();
+        let err = io::Error::from(io::ErrorKind::AddrInUse);
+        for _ in 0..20 {
+            retry.failed(&err);
+        }
+        assert_eq!(retry.delay, REBIND_RETRY_MAX);
     }
 
     /// Regression test for the Windows behavior handled by [`is_transient_read_error`].
