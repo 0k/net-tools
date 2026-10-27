@@ -365,8 +365,37 @@ pub(crate) fn is_interesting_interface(name: &str) -> bool {
             return false;
         }
     }
-    let _ = name;
-    true
+    !is_virtual_bridge(name)
+}
+
+/// Name prefixes of host-local virtual interfaces created by container and
+/// VM managers (docker, libvirt, podman): bridges and their `veth` pairs.
+///
+/// They never carry a path to another host, yet a container that restarts
+/// in a loop creates and deletes a `veth` (and toggles its bridge) every few
+/// seconds.  Treating that churn as a network change makes every socket
+/// rebind constantly, and advertising the bridge addresses hands remote
+/// peers candidates they can never reach.
+#[cfg(target_os = "linux")]
+const VIRTUAL_BRIDGE_PREFIXES: &[&str] = &["br-", "docker", "veth", "virbr"];
+
+/// Whether `name` is a host-local container/VM bridge or `veth` interface.
+///
+/// Such interfaces are not interesting (their churn is not a major change),
+/// and their addresses are left out of [`LocalAddresses`] and of the v4/v6
+/// availability flags.  Only recognised on Linux.
+pub(crate) fn is_virtual_bridge(name: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        VIRTUAL_BRIDGE_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = name;
+        false
+    }
 }
 
 /// The details about a default route.
@@ -455,6 +484,69 @@ mod tests {
         iface.name = "eth1".to_string();
         new.interfaces.insert("eth1".to_string(), iface);
         assert!(new.is_major_change(&old));
+    }
+
+    /// A copy of the fake interface renamed and re-addressed.
+    #[cfg(target_os = "linux")]
+    fn fake_iface(name: &str, ip: Ipv4Addr, index: u32) -> Interface {
+        let mut iface = Interface::fake();
+        iface.name = name.to_string();
+        iface.index = index;
+        iface.addrs = vec![IpNet::V4(Ipv4Net::new(ip, 16).unwrap())];
+        iface
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_iface(state: &State, iface: Interface) -> State {
+        let mut state = state.clone();
+        state.interfaces.insert(iface.name.clone(), iface);
+        state
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn container_bridge_churn_is_not_a_major_change() {
+        let base = State::fake();
+        for name in ["veth8c0b68e", "br-a8b37eb8b48f", "docker0", "virbr0"] {
+            let churned = with_iface(&base, fake_iface(name, Ipv4Addr::new(172, 30, 0, 1), 9));
+            assert!(!churned.is_major_change(&base), "{name} appeared");
+            assert!(!base.is_major_change(&churned), "{name} disappeared");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_new_physical_interface_is_still_a_major_change() {
+        let base = State::fake();
+        let plugged = with_iface(&base, fake_iface("eth1", Ipv4Addr::new(10, 0, 0, 2), 9));
+        assert!(plugged.is_major_change(&base));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn container_and_vm_bridges_are_not_interesting() {
+        for name in ["docker0", "br-a8b37eb8b48f", "veth8c0b68e", "virbr0"] {
+            assert!(is_virtual_bridge(name), "{name}");
+            assert!(!is_interesting_interface(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn physical_and_tunnel_interfaces_stay_interesting() {
+        for name in [
+            "eth0",
+            "enp3s0",
+            "enx00e04c6810f4",
+            "wlp192s0",
+            "wlan0",
+            "wg0",
+            "tailscale0",
+            "lo",
+            "bridge0",
+        ] {
+            assert!(!is_virtual_bridge(name), "{name}");
+            assert!(is_interesting_interface(name), "{name}");
+        }
     }
 
     #[test]

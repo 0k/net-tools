@@ -82,7 +82,7 @@ pub(super) async fn get_state() -> State {
 
     for raw in raw {
         let iface = to_interface(raw);
-        if iface.is_up() {
+        if iface.is_up() && !super::is_virtual_bridge(iface.name()) {
             for pfx in iface.addrs() {
                 let addr = pfx.addr();
                 if addr.is_loopback() {
@@ -199,6 +199,10 @@ fn local_addresses(ifaces: &[netdev::Interface]) -> LocalAddresses {
             // Skip down interfaces
             continue;
         }
+        if super::is_virtual_bridge(&iface.name) {
+            // Host-local container/VM bridge: unreachable from peers.
+            continue;
+        }
         let ifc_is_loopback = is_loopback(iface);
         let addrs = iface
             .ipv4
@@ -274,6 +278,30 @@ mod tests {
         dbg!(&addrs);
         assert!(!addrs.loopback.is_empty());
         assert!(!addrs.regular.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn raw_iface(name: &str, ip: std::net::Ipv4Addr, index: u32) -> netdev::Interface {
+        let mut iface = netdev::Interface::dummy();
+        iface.name = name.to_string();
+        iface.index = index;
+        iface.flags = IFF_UP;
+        iface.ipv4 = vec![ipnet::Ipv4Net::new(ip, 16).unwrap()];
+        iface
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn container_bridge_addresses_are_not_local_addresses() {
+        use std::net::Ipv4Addr;
+        let ifaces = [
+            raw_iface("wifi0", Ipv4Addr::new(192, 168, 0, 189), 2),
+            raw_iface("docker0", Ipv4Addr::new(172, 17, 0, 1), 3),
+            raw_iface("br-a8b37eb8b48f", Ipv4Addr::new(172, 30, 0, 1), 4),
+            raw_iface("veth8c0b68e", Ipv4Addr::new(172, 30, 0, 2), 5),
+        ];
+        let addrs = local_addresses(&ifaces);
+        assert_eq!(addrs.regular, vec![IpAddr::from([192, 168, 0, 189])]);
     }
 
     #[test]
